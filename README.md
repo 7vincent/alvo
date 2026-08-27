@@ -1,6 +1,199 @@
-# Separação de fotos por rosto — solenidade
+# ALVO — busca de rostos em massas de fotos
 
-Tudo roda **local**. Nenhuma imagem e nenhum embedding sai da máquina.
+Você tem um acervo de milhares de fotos e uma pergunta simples: **em quais
+delas esta pessoa aparece?**
+
+Responder isso na mão é inviável — 1837 fotos com 6466 rostos são horas de
+olho humano por pessoa procurada, e o cansaço faz errar. Este projeto responde
+em segundos, a partir de **uma única foto de referência**, e devolve uma pasta
+com as fotos encontradas ordenadas da mais confiável para a mais duvidosa.
+
+Tudo roda **local**. Nenhuma imagem e nenhum embedding sai da máquina — é
+requisito, não preferência. O único momento em que a internet é usada é o
+download do modelo, uma vez.
+
+> O primeiro acervo processado foi uma solenidade militar, e por isso o banco
+> padrão se chama `solenidade.db`. Isso é só um nome de arquivo: a ferramenta
+> não sabe nada sobre solenidades, e serve para qualquer massa de fotos —
+> outro evento, um acervo de câmeras, um backup de anos.
+
+## Como funciona
+
+Reconhecimento facial aqui não é "comparar duas fotos". São três etapas
+distintas, e entender a diferença entre elas é o que permite ajustar o
+resultado quando ele vem errado.
+
+```
+  foto  ──►  DETECÇÃO  ──►  recorte do rosto  ──►  EMBEDDING  ──►  512 números
+                                                                        │
+  foto de referência ──► ... mesmo caminho ... ──► 512 números          │
+                                                          │             │
+                                                          └──► DISTÂNCIA ──► corte
+```
+
+**1. Detecção — "onde há rostos nesta imagem?"**
+
+Um modelo chamado SCRFD varre a foto e devolve uma caixa em volta de cada
+rosto, com uma nota de confiança. Ele não faz ideia de *quem* é: só sabe que
+ali tem um rosto.
+
+O detector compara a imagem contra **âncoras de escala** — tamanhos de rosto
+que ele espera encontrar. Isso tem uma consequência que morde na prática: um
+rosto grande demais em relação ao quadro não casa com âncora nenhuma e **não é
+detectado**. É por isso que uma referência recortada colada no rosto pode
+devolver zero rostos, e por que aumentar a resolução da imagem não resolve
+(o tamanho *relativo* não muda) — o que resolve é diminuir o `det_size`.
+
+**2. Embedding — "descreva este rosto em números"**
+
+O recorte do rosto passa por um segundo modelo, que devolve um vetor de **512
+números**. Esse vetor é a assinatura matemática daquele rosto. Rostos da mesma
+pessoa produzem vetores parecidos; de pessoas diferentes, vetores distantes.
+
+O modelo é treinado para que a *direção* do vetor carregue a identidade, então
+todo vetor é normalizado para comprimento 1 antes de ser guardado. Duas
+consequências práticas:
+
+- a semelhança entre dois rostos vira um **produto escalar** — sem divisão,
+  sem raiz quadrada. A distância cosseno é literalmente `1 - (a · b)`;
+- distância euclidiana e distância cosseno passam a ordenar igual, o que
+  permite ao agrupamento usar a árvore do HDBSCAN em vez de materializar uma
+  matriz N×N de distâncias.
+
+Guardar o vetor sem normalizar quebra as duas coisas em silêncio.
+
+**3. Distância e corte — "perto o bastante para ser a mesma pessoa?"**
+
+Aqui está o trabalho de verdade. A distância vai de `0.0` (idênticos) a `2.0`,
+e **não existe um número universal que separe "mesma pessoa" de "pessoa
+diferente"**. O valor certo muda com a qualidade da referência, com o ângulo
+dos rostos e com o próprio acervo.
+
+O erro clássico é confiar num limiar fixo. O `alvo` faz outra coisa: mede a
+distância da referência contra **todos** os rostos indexados, ordena, e procura
+o **maior degrau** — o vão onde a população muda de "provavelmente ela" para
+"provavelmente outra pessoa". O corte vai ali.
+
+## A tecnologia
+
+| peça | o que é | papel aqui |
+|---|---|---|
+| [InsightFace](https://github.com/deepinsight/insightface) `buffalo_l` | pacote com 5 modelos ONNX (~300 MB) | fornece detector e reconhecedor |
+| `det_10g.onnx` | SCRFD, detector de rostos | acha as caixas. Entrada de tamanho livre — daí o `--det-size` |
+| `w600k_r50.onnx` | ResNet-50 treinada com perda ArcFace sobre o WebFace600K | gera o vetor de 512 dimensões. Entrada 112×112 |
+| ONNX Runtime | motor de inferência | roda os modelos. **CPU** por padrão aqui |
+| SQLite | banco em arquivo único | o índice, e a interface entre os scripts |
+| NumPy | álgebra | a busca inteira é uma multiplicação de matriz |
+| scikit-learn (HDBSCAN) | agrupamento por densidade | separa todo mundo sem referência nenhuma |
+| Pillow + pillow-heif | leitura de imagem | inclusive HEIC do iPhone, e a correção de EXIF |
+| OpenCV | visão computacional | variância do Laplaciano (nitidez) e as folhas de contato |
+
+Dos 5 modelos do pacote, a pipeline usa **2**: `det_10g` e `w600k_r50`. Os
+outros três (landmarks 2D, landmarks 3D, idade/gênero) são carregados junto
+porque o `FaceAnalysis` carrega o pacote inteiro, e nunca são usados.
+
+### Duas decisões que carregam o resultado
+
+**A orientação EXIF é lida antes de tudo.** Uma foto em retrato lida sem
+`ImageOps.exif_transpose` chega deitada, e o detector simplesmente não acha
+rosto nenhum. Essa linha sozinha vale mais para a taxa de acerto do que
+qualquer ajuste de limiar.
+
+**As caixas são guardadas em coordenadas relativas (0..1).** A imagem é
+reduzida para no máximo 2200px de lado antes da detecção; guardar a caixa em
+pixels absolutos quebraria todo recorte feito depois.
+
+## Arquitetura
+
+Quatro scripts autônomos e um utilitário, rodados na ordem. Não é biblioteca
+nem serviço — cada um faz uma etapa e conversa com o seguinte pelo **SQLite**.
+
+```
+  Fotos/            (somente leitura, nunca tocada)
+    │
+    ▼
+  indexar.py   ──►  solenidade.db : fotos, rostos     [caro, ~40 min, retomável]
+    │
+    ├──► buscar.py    ──►  pasta por pessoa           [rápido, por referência]
+    │      ▲
+    │      └── pessoas.db : cadastro entre acervos
+    │
+    └──► agrupar.py   ──►  solenidade.db : grupos     [sem referência nenhuma]
+           │                └──► clusters/*.jpg       (folhas de contato)
+           │                       │
+           │                       ▼  renomeio manual
+           └──► distribuir.py ──►  pasta por pessoa
+```
+
+O `alvo.py` fica por cima do `buscar.py`: analisa o histograma, escolhe o
+limiar e chama o `buscar.py` para escrever. Ele nunca cria nem apaga foto.
+
+### Os dois bancos, e por que são separados
+
+| banco | o que guarda | vida útil |
+|---|---|---|
+| `solenidade.db` | o índice de **um acervo**: cada foto, cada rosto, cada vetor | descartável — reindexar reconstrói |
+| `pessoas.db` | o cadastro de **quem é quem**: nome → vetores | permanente, e é o que barateia o próximo acervo |
+
+> **Nenhum dos dois vem no repositório, e nenhum dos dois deve entrar nele.**
+> Os dois são criados **automaticamente** na primeira execução: o
+> `solenidade.db` quando você roda o `indexar.py`, e o `pessoas.db` na primeira
+> busca por referência. Se o arquivo não existir, o script cria o banco e as
+> tabelas sozinho — não há passo de migração nem script de criação a rodar.
+>
+> Eles ficam de fora do git de propósito: contêm **dado biométrico** das
+> pessoas do seu acervo (veja [LGPD](#lgpd)). O `.gitignore` cobre `*.db`,
+> `*.db-wal` e `*.db-shm`.
+
+Quem clona este repositório começa, portanto, **sem banco nenhum** — e é assim
+que tem de ser. Do zero até a primeira busca:
+
+```bash
+python indexar.py /caminho/do/acervo --db meuacervo.db   # cria o indice
+alvo Fulano --db meuacervo.db                            # cria o cadastro
+```
+
+O `indexar.py` é **retomável**: ele guarda o caminho de cada foto já processada
+e pula o que já está lá, então interromper no meio e rodar de novo não custa
+nada. É o que torna aceitável uma etapa de 40 minutos.
+
+A separação é deliberada. O índice do acervo é grande e recriável; o cadastro
+é pequeno e insubstituível — é o único arquivo do projeto que amarra um
+**nome** a um **vetor biométrico**.
+
+Com alguém já no cadastro, encontrá-lo num acervo novo dispensa foto de
+referência e nem carrega o modelo de reconhecimento:
+
+```bash
+python indexar.py ~/Fotos/OutroAcervo --db outro.db
+python buscar.py --conhecidos --db outro.db --saida entrega --copiar
+```
+
+### Esquema
+
+| tabela | escrita por | colunas que importam |
+|---|---|---|
+| `fotos` | `indexar.py` | `caminho` (UNIQUE — é a chave de retomada), `n_rostos`, `status` |
+| `rostos` | `indexar.py` | `emb` BLOB = float32[512] **já normalizado**, `x1..y2` relativos, `nitidez`, `area_rel` |
+| `grupos` | `agrupar.py` | `rosto_id` → `grupo`. Recriada do zero a cada execução |
+| `pessoas` / `referencias` | `memoria.py` | `nome`, e os vetores com `fonte` = `referencia` ou `match` |
+
+Mudar esse esquema significa mexer em todos os consumidores.
+
+### Qualidade: o que nunca entra no índice
+
+Rosto ruim não vira erro de reconhecimento — vira poluição silenciosa. O
+`indexar.py` descarta antes de gravar (constantes do módulo, não flags):
+
+- `det_score` abaixo de **0.60** — o detector mesmo não confia;
+- lado da caixa abaixo de **45 px** — não há informação ali.
+
+Cada rosto aceito ainda guarda dois números que a busca usa depois:
+
+- **`nitidez`** — variância do Laplaciano do recorte. Baixo = borrado;
+- **`area_rel`** — fração do quadro ocupada pelo rosto. Abaixo de ~0.3% é
+  gente de multidão, cujo vetor tende ao "rosto médio" e casa fraco com todo
+  mundo.
 
 ## Instalação (~5 min)
 
@@ -50,7 +243,7 @@ Se casar com mais de um arquivo, ele lista e para.
 arquivo vira o nome da pasta e o nome no cadastro, então nomeie o arquivo como
 você quer a pasta — `Alvos/Maj-Fulano.jpeg` → `Alvos/Maj-Fulano/`.
 
-Não precisa reindexar. O `indexar.py` descreve o *evento*, não as pessoas: os
+Não precisa reindexar. O `indexar.py` descreve o *acervo*, não as pessoas: os
 rostos já estão medidos. Alvo novo é só um vetor comparado contra eles, uns 10
 segundos, quase tudo carregando o modelo.
 
@@ -106,8 +299,8 @@ qualquer diretório.
 | opção | padrão |
 |---|---|
 | `--alvos DIR` | `Alvos/` — pasta das referências **e** das entregas |
-| `--db ARQ` | `solenidade.db` — índice do evento, feito pelo `indexar.py` |
-| `--memoria ARQ` | `pessoas.db` — cadastro de rostos entre eventos |
+| `--db ARQ` | `solenidade.db` — índice do acervo, feito pelo `indexar.py` |
+| `--memoria ARQ` | `pessoas.db` — cadastro de rostos entre acervos |
 
 ### Lendo a saída
 
@@ -135,7 +328,7 @@ alvo, medida só com o vetor da foto de referência:
 | prf-beltrano | 0.246 | 6 |
 | **CEL_MENGANO** | **0.489** | **0** |
 
-Alvo que está no evento aparece com melhor acerto entre 0.01 e 0.25 e um
+Alvo que está no acervo aparece com melhor acerto entre 0.01 e 0.25 e um
 punhado de rostos no núcleo. O `CEL_MENGANO` veio ao dobro da distância do
 pior caso, com núcleo vazio — e mesmo assim o detector de degrau achou o vão
 **mais largo já visto** (0.108) e selecionou 31 fotos.
@@ -152,11 +345,11 @@ Sintomas de referência ruim ou pessoa ausente:
 
 O conserto costuma ser a referência, não o limiar: **domínio importa mais que
 resolução.** Um frame de webcam do Deltrano parou em 0.375 sem gap nenhum; um
-recorte de 185×192 tirado do próprio evento foi a 0.039 com gap limpo.
+recorte de 185×192 tirado do próprio acervo foi a 0.039 com gap limpo.
 
 ## A pipeline completa
 
-Só é necessária uma vez por evento — depois disso, o dia a dia é o `alvo`.
+Só é necessária uma vez por acervo — depois disso, o dia a dia é o `alvo`.
 
 ```bash
 # 1. INDEXAR — a etapa cara. ~40 min para as 1837 fotos na CPU (~0,8 foto/s).
@@ -177,6 +370,16 @@ python distribuir.py --db solenidade.db --saida ../Entrega
 python distribuir.py --db solenidade.db --saida ../Entrega --copiar   # pendrive/zip
 ```
 
+**Busca e agrupamento respondem perguntas diferentes.** A busca parte de *quem
+você procura* e precisa de uma foto de referência. O agrupamento não precisa de
+referência nenhuma: ele junta os rostos por semelhança e devolve grupos
+anônimos, para você descobrir *quem está no acervo* — inclusive quem você não
+esperava.
+
+O passo 4 é manual **de propósito**. Construir uma interface de revisão foi
+avaliado em uma semana de trabalho para ganho nenhum: o Finder em modo galeria
+já mostra as folhas de contato lado a lado, e renomear arquivo é rápido.
+
 > `indexar.py` é idempotente: re-rodar depois de um crash não custa nada.
 > `agrupar.py` **não é** — ele faz `DROP TABLE grupos` a cada execução, o que
 > descarta a numeração que os seus renomeios do passo 4 usam. Reagrupar
@@ -193,7 +396,7 @@ nome do arquivo de referência. A partir daí, achar a mesma pessoa numa pasta d
 fotos nova não precisa mais de foto de referência nenhuma:
 
 ```bash
-python indexar.py ~/Fotos/OutroEvento --db outro.db     # indexa o evento novo
+python indexar.py ~/Fotos/OutroAcervo --db outro.db     # indexa o acervo novo
 python buscar.py --conhecidos --db outro.db --saida entrega --copiar
 python buscar.py --conhecidos --quem "Cel-Ciclano" --db outro.db   # só uma pessoa
 ```
@@ -215,8 +418,11 @@ mesmo nome. Para somar ângulos a alguém que já existe, use `--realimentar`.
 ### Realimentar (importante para o recall)
 
 Uma pessoa pode ter **vários** vetores, e a busca usa a menor distância contra
-qualquer um deles. Isso resolve o problema de perfil: o ArcFace é treinado em
-rostos frontais, então uma referência frontal única perde as fotos de lado.
+qualquer um deles — **não a média**. A diferença importa: a média de um vetor
+frontal com um de perfil produz um borrão que não casa bem com nenhum dos dois,
+enquanto a menor distância deixa cada ângulo guardado cobrir a sua própria
+pose. Isso resolve o problema de perfil, porque o ArcFace é treinado em rostos
+frontais e penaliza vista lateral com força.
 
 Depois de conferir um resultado, devolva os rostos encontrados ao cadastro:
 
@@ -258,6 +464,8 @@ passa a casar com outros borrados. Nesta base a mediana de nitidez é 149 e só
 
 ## Ajuste fino
 
+Acerto aqui é trabalho de limiar, não de código.
+
 | Sintoma | O que fazer |
 |---|---|
 | Poucos rostos detectados em fotos de formação | `indexar.py --det-size 1600` (reindexar, ~2x mais lento) |
@@ -266,33 +474,35 @@ passa a casar com outros borrados. Nesta base a mediana de nitidez é 149 e só
 | Busca perdendo fotos | `alvo NOME --limiar 0.55`, ou `--realimentar 12` |
 | Busca perdendo fotos de perfil | `--realimentar` resolve melhor que subir o limiar |
 | Busca trazendo gente errada | `alvo NOME --limiar 0.35` |
-| Referência não detecta rosto nenhum | recorte menos justo, ou uma foto do próprio evento |
+| Referência não detecta rosto nenhum | recorte menos justo, ou uma foto do próprio acervo |
 | Muito rosto borrado/minúsculo | `agrupar.py --nitidez-min 60 --area-min 0.002` |
 | Entregar só fotos onde a pessoa é o assunto | `distribuir.py --area-min 0.01` |
 
 ## Regras
 
-- `Fotos/` é **somente leitura**. Nada é movido, renomeado ou apagado. Nunca.
+- A pasta de origem é **somente leitura**. Nada é movido, renomeado ou
+  apagado. Nunca.
 - Saída usa **hardlink** — 50 pessoas × 100 fotos custa ~0 bytes. O que o `du`
   mostra é o mesmo dado contado duas vezes, não espaço novo. Só use `--copiar`
-  no momento da entrega (pendrive, zip).
+  no momento da entrega (pendrive, zip). Destino em outro sistema de arquivos
+  cai para cópia sozinho.
 - O prefixo numérico no nome do arquivo é a distância: os primeiros arquivos da
   pasta são os mais confiáveis. **Confira de baixo para cima**, que é onde mora
   o erro.
 - **A decisão do `alvo` é 100% numérica.** Ele garante que o conjunto está
   separado do resto, não que seja a pessoa certa. Espere 70–85% de acerto,
-  não 99%.
+  não 99% — e diga isso a quem recebe, em vez de sugerir o contrário.
 
 ## LGPD
 
-`solenidade.db` e `pessoas.db` contêm **dado biométrico** (art. 5º, II) de
-militares — e `pessoas.db` ainda associa o vetor a um **nome**, o que o torna
-mais sensível que o índice do evento.
+O índice do acervo e o `pessoas.db` contêm **dado biométrico** (Lei
+13.709/2018, art. 5º, II). O `pessoas.db` ainda associa o vetor a um **nome**,
+o que o torna mais sensível que o índice.
 
 Não versione, não suba pra nuvem, não compartilhe — nem como contexto para
 ferramenta remota. Guarde offline ou apague depois da entrega — mas note que
-ele é o que torna a próxima solenidade barata (as pessoas já ficam
-reconhecidas). Se for guardar, vale alinhar com o comando antes.
+ele é o que torna o próximo acervo barato (as pessoas já ficam reconhecidas).
+Se for guardar, vale alinhar com quem responde pela operação.
 
 > O `.gitignore` deste diretório cobre `Fotos/`, `Alvos/` e `.venv/`, mas
 > **não** cobre `*.db`. Confira antes de qualquer `git add .`.
