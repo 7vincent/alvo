@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""
+buscar.py - "Te mando um rosto, voce acha as fotos dele."
+
+    python buscar.py referencias/cap_silva.jpg --db solenidade.db
+    python buscar.py referencias/            --db solenidade.db --limiar 0.42
+
+Cada arquivo de referencia vira uma pasta em ./saida/<nome-do-arquivo>/ com
+hardlinks para as fotos onde aquela pessoa aparece. Hardlink = 0 bytes
+extras. As fotos originais nao sao tocadas.
+
+Se voce tiver VARIAS fotos da mesma pessoa, coloque-as numa subpasta com o
+nome dela: referencias/cap_silva/*.jpg  -> a media dos embeddings e bem mais
+robusta que uma foto so.
+"""
+import argparse
+import sqlite3
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+EXTENSOES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif"}
+
+# Distancia cosseno. Menor = mais parecido.
+#   0.35 -> conservador (perde fotos, quase nao erra)
+#   0.45 -> equilibrio
+#   0.55 -> agressivo (pega mais, comeca a misturar gente parecida)
+LIMIAR_PADRAO = 0.45
+
+
+def carregar_indice(db):
+    con = sqlite3.connect(db)
+    linhas = con.execute(
+        "SELECT r.emb, f.caminho FROM rostos r JOIN fotos f ON f.id = r.foto_id"
+    ).fetchall()
+    if not linhas:
+        raise SystemExit("Indice vazio. Rode indexar.py primeiro.")
+    embs = np.vstack([np.frombuffer(b, dtype=np.float32) for b, _ in linhas])
+    caminhos = [c for _, c in linhas]
+    return embs, caminhos
+
+
+def embutir(app, caminho):
+    """Devolve o embedding do maior rosto da imagem de referencia."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from indexar import carregar_imagem_bgr
+
+    img, _, _ = carregar_imagem_bgr(caminho)
+    rostos = app.get(img)
+    if not rostos:
+        return None
+    maior = max(rostos, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    return np.asarray(maior.normed_embedding, dtype=np.float32)
+
+
+def coletar_consultas(alvo):
+    """Devolve {nome_pessoa: [arquivos]}."""
+    alvo = Path(alvo).expanduser().resolve()
+    if alvo.is_file():
+        return {alvo.stem: [alvo]}
+    consultas = defaultdict(list)
+    for p in sorted(alvo.rglob("*")):
+        if p.is_file() and p.suffix.lower() in EXTENSOES:
+            nome = p.parent.name if p.parent != alvo else p.stem
+            consultas[nome].append(p)
+    return consultas
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("referencia", help="arquivo ou pasta com fotos de referencia")
+    ap.add_argument("--db", default="solenidade.db")
+    ap.add_argument("--saida", default="saida")
+    ap.add_argument("--limiar", type=float, default=LIMIAR_PADRAO)
+    ap.add_argument("--copiar", action="store_true", help="copiar de verdade em vez de hardlink")
+    args = ap.parse_args()
+
+    from insightface.app import FaceAnalysis
+
+    embs, caminhos = carregar_indice(args.db)
+    print(f"Indice: {len(embs)} rostos em {len(set(caminhos))} fotos")
+
+    app = FaceAnalysis(
+        name="buffalo_l",
+        providers=["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+    app.prepare(ctx_id=0, det_size=(1024, 1024))
+
+    consultas = coletar_consultas(args.referencia)
+    if not consultas:
+        raise SystemExit("Nenhuma imagem de referencia encontrada.")
+
+    raiz_saida = Path(args.saida).expanduser().resolve()
+    for nome, arquivos in consultas.items():
+        vetores = [v for v in (embutir(app, a) for a in arquivos) if v is not None]
+        if not vetores:
+            print(f"  ! {nome}: nenhum rosto detectado na referencia")
+            continue
+        q = np.mean(vetores, axis=0)
+        q /= np.linalg.norm(q)
+
+        dist = 1.0 - embs @ q
+        idx = np.where(dist <= args.limiar)[0]
+
+        # melhor distancia por foto (uma foto pode ter varios rostos)
+        melhor = {}
+        for i in idx:
+            c = caminhos[i]
+            melhor[c] = min(melhor.get(c, 9.9), float(dist[i]))
+
+        destino = raiz_saida / nome
+        destino.mkdir(parents=True, exist_ok=True)
+        for c, d in sorted(melhor.items(), key=lambda kv: kv[1]):
+            origem = Path(c)
+            # prefixo com a distancia: os primeiros arquivos da pasta sao os
+            # mais confiaveis, o que torna a conferencia visual muito rapida
+            alvo = destino / f"{d:.3f}_{origem.name}"
+            if alvo.exists():
+                continue
+            try:
+                if args.copiar:
+                    import shutil
+
+                    shutil.copy2(origem, alvo)
+                else:
+                    alvo.hardlink_to(origem)
+            except OSError:
+                import shutil
+
+                shutil.copy2(origem, alvo)
+
+        print(f"  {nome}: {len(melhor)} fotos  ({len(vetores)} referencia(s))")
+
+    print(f"\nResultado em {raiz_saida}")
+
+
+if __name__ == "__main__":
+    main()

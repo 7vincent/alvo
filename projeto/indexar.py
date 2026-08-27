@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+indexar.py - Detecta rostos nas fotos e grava embeddings num SQLite.
+
+Etapa cara e irreversivel. Roda uma vez. Suporta retomada: se cair no meio,
+rode de novo que ele pula o que ja foi processado.
+
+    python indexar.py /caminho/das/fotos --db solenidade.db
+
+As fotos NUNCA sao modificadas ou movidas.
+"""
+import argparse
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+EXTENSOES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif"}
+
+# Filtros de qualidade. Rosto ruim nao vira erro de reconhecimento,
+# vira poluicao no cluster. Ajuste se estiver perdendo gente demais.
+DET_SCORE_MIN = 0.60
+LADO_MIN_PX = 45
+
+
+def abrir_db(caminho):
+    con = sqlite3.connect(caminho)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS fotos (
+            id        INTEGER PRIMARY KEY,
+            caminho   TEXT UNIQUE NOT NULL,
+            largura   INTEGER,
+            altura    INTEGER,
+            n_rostos  INTEGER DEFAULT 0,
+            status    TEXT DEFAULT 'ok'
+        );
+        CREATE TABLE IF NOT EXISTS rostos (
+            id        INTEGER PRIMARY KEY,
+            foto_id   INTEGER NOT NULL REFERENCES fotos(id),
+            x1 REAL, y1 REAL, x2 REAL, y2 REAL,   -- relativos (0..1)
+            det_score REAL,
+            nitidez   REAL,
+            area_rel  REAL,
+            emb       BLOB NOT NULL               -- float32[512] normalizado
+        );
+        CREATE INDEX IF NOT EXISTS ix_rostos_foto ON rostos(foto_id);
+        """
+    )
+    con.commit()
+    return con
+
+
+def carregar_imagem_bgr(caminho, lado_max=2200):
+    """Le a imagem respeitando a orientacao EXIF e devolve array BGR.
+
+    A orientacao EXIF importa muito: foto retrato lida sem correcao vem
+    deitada e o detector simplesmente nao acha os rostos.
+    """
+    from PIL import Image, ImageOps
+
+    try:
+        import pillow_heif
+
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+
+    img = Image.open(caminho)
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("RGB")
+    larg, alt = img.size
+    if max(larg, alt) > lado_max:
+        escala = lado_max / max(larg, alt)
+        img = img.resize((int(larg * escala), int(alt * escala)), Image.LANCZOS)
+    arr = np.asarray(img)
+    return arr[:, :, ::-1].copy(), larg, alt  # RGB -> BGR
+
+
+def nitidez(crop):
+    """Variancia do Laplaciano. Baixo = borrado."""
+    import cv2
+
+    if crop.size == 0:
+        return 0.0
+    cinza = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(cinza, cv2.CV_64F).var())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("diretorio", help="pasta com as fotos (varre recursivamente)")
+    ap.add_argument("--db", default="solenidade.db")
+    ap.add_argument(
+        "--det-size",
+        type=int,
+        default=1024,
+        help="resolucao do detector. 1024 e o equilibrio; 1600 acha rosto "
+        "pequeno de formacao mas fica ~2x mais lento",
+    )
+    ap.add_argument(
+        "--coreml",
+        action="store_true",
+        help="tenta acelerar com CoreML. Em varias combinacoes de "
+        "onnxruntime/macOS o provider carrega mas quebra na inferencia, "
+        "derrubando todas as fotos. O padrao (CPU) e mais lento e confiavel",
+    )
+    args = ap.parse_args()
+
+    import cv2  # noqa: F401  (garante erro cedo se faltar)
+    from insightface.app import FaceAnalysis
+
+    raiz = Path(args.diretorio).expanduser().resolve()
+    arquivos = sorted(
+        p for p in raiz.rglob("*") if p.is_file() and p.suffix.lower() in EXTENSOES
+    )
+    print(f"{len(arquivos)} arquivos encontrados em {raiz}")
+
+    con = abrir_db(args.db)
+    ja_feitos = {r[0] for r in con.execute("SELECT caminho FROM fotos")}
+    pendentes = [p for p in arquivos if str(p) not in ja_feitos]
+    print(f"{len(pendentes)} pendentes ({len(ja_feitos)} ja indexados)\n")
+    if not pendentes:
+        return
+
+    # CPU por padrao: nesta maquina o CoreML carrega mas falha na inferencia
+    # (erro no no CoreMLExecutionProvider_*), derrubando foto por foto.
+    provedores = (
+        ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+        if args.coreml
+        else ["CPUExecutionProvider"]
+    )
+    app = FaceAnalysis(name="buffalo_l", providers=provedores)
+    app.prepare(ctx_id=0, det_size=(args.det_size, args.det_size))
+
+    t0 = time.time()
+    total_rostos = 0
+    for i, p in enumerate(pendentes, 1):
+        try:
+            img, larg_orig, alt_orig = carregar_imagem_bgr(p)
+        except Exception as e:
+            con.execute(
+                "INSERT OR IGNORE INTO fotos(caminho,status) VALUES(?,?)",
+                (str(p), f"erro_leitura: {e}"),
+            )
+            con.commit()
+            continue
+
+        h, w = img.shape[:2]
+        cur = con.execute(
+            "INSERT OR IGNORE INTO fotos(caminho,largura,altura) VALUES(?,?,?)",
+            (str(p), larg_orig, alt_orig),
+        )
+        foto_id = cur.lastrowid
+        con.commit()
+
+        try:
+            rostos = app.get(img)
+        except Exception as e:
+            con.execute("UPDATE fotos SET status=? WHERE id=?", (f"erro_det: {e}", foto_id))
+            con.commit()
+            continue
+
+        n_ok = 0
+        for f in rostos:
+            x1, y1, x2, y2 = [float(v) for v in f.bbox]
+            lado = min(x2 - x1, y2 - y1)
+            if f.det_score < DET_SCORE_MIN or lado < LADO_MIN_PX:
+                continue
+            crop = img[max(0, int(y1)) : int(y2), max(0, int(x1)) : int(x2)]
+            emb = np.asarray(f.normed_embedding, dtype=np.float32)
+            con.execute(
+                "INSERT INTO rostos(foto_id,x1,y1,x2,y2,det_score,nitidez,area_rel,emb)"
+                " VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    foto_id,
+                    x1 / w, y1 / h, x2 / w, y2 / h,
+                    float(f.det_score),
+                    nitidez(crop),
+                    ((x2 - x1) * (y2 - y1)) / (w * h),
+                    emb.tobytes(),
+                ),
+            )
+            n_ok += 1
+
+        con.execute("UPDATE fotos SET n_rostos=? WHERE id=?", (n_ok, foto_id))
+        con.commit()
+        total_rostos += n_ok
+
+        if i % 25 == 0 or i == len(pendentes):
+            decorrido = time.time() - t0
+            restante = decorrido / i * (len(pendentes) - i)
+            print(
+                f"[{i}/{len(pendentes)}] {total_rostos} rostos | "
+                f"{i/decorrido:.1f} fotos/s | faltam ~{restante/60:.0f} min",
+                flush=True,
+            )
+
+    print(f"\nPronto. {total_rostos} rostos em {args.db}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
