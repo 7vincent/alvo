@@ -1,6 +1,7 @@
 .venv/*
 Fotos/*
 Alvos/*
+Videos/*
 
 # Bancos gerados localmente. Contem dado biometrico -- NUNCA versionar.
 # Recriados por indexar.py (indice do acervo) e pela primeira busca (cadastro).
